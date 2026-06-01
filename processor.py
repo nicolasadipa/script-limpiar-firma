@@ -230,21 +230,27 @@ def _clean_morphology(binary: np.ndarray) -> np.ndarray:
 
 def _isolate_main_cluster(binary: np.ndarray) -> np.ndarray:
     """
-    Aísla el cluster principal de tinta y descarta cualquier marca lejana
-    (logos de CamScanner, sellos de esquina, marcas de agua, foliado).
+    Aísla los clusters significativos de tinta y descarta cualquier marca
+    lejana de tamaño pequeño (logos de CamScanner, sellos de esquina,
+    marcas de agua, foliado).
 
     Estrategia:
       1. Dilata la binaria con un kernel proporcional al tamaño de imagen.
-         Eso conecta componentes cercanos entre sí (palabras separadas de
-         una misma firma) sin llegar a unir cosas en partes opuestas.
-      2. Encuentra el componente conectado más grande en la versión dilatada.
-      3. Usa ese componente como máscara para conservar solo la tinta que
-         pertenece al grupo principal.
+         Eso conecta componentes cercanos entre sí (letras de una misma
+         palabra, palabras adyacentes) sin llegar a unir cosas en partes
+         opuestas de la página.
+      2. Encuentra todos los componentes conectados en la versión dilatada.
+      3. Conserva el más grande Y todos los demás cuya área sea al menos
+         CLUSTER_MIN_AREA_RATIO del más grande. Una firma de dos o tres
+         palabras genera clusters comparables en tamaño; un logo de
+         escáner siempre es mucho más chico que la firma.
 
-    Una firma típica tiene gaps internos de <100px entre palabras; el footer
-    de un escáner suele estar a 200-500px del cuerpo. Con un kernel de
-    ~5% del lado largo (125px en una imagen 2500x), los unimos lo primero
-    sin alcanzar lo segundo.
+    Esto cubre los dos casos a la vez:
+      - Si las palabras se conectan en uno solo (gap < kernel): un cluster
+        grande con todo.
+      - Si quedan separadas (gap > kernel): varios clusters comparables;
+        el filtro de área los mantiene todos. Solo cae lo realmente chico
+        (footer del escáner, foliado, etc.).
     """
     if not np.any(binary):
         return binary
@@ -261,11 +267,16 @@ def _isolate_main_cluster(binary: np.ndarray) -> np.ndarray:
     if num_labels < 2:
         return binary
 
-    # Componente más grande excluyendo el fondo (label 0)
+    # Áreas de cada cluster (en la versión dilatada), excluyendo el fondo
     areas = stats[1:, cv2.CC_STAT_AREA]
-    main_label = 1 + int(np.argmax(areas))
-    mask = (labels == main_label).astype(np.uint8) * 255
+    max_area = int(areas.max())
+    min_keep_area = int(max_area * config.CLUSTER_MIN_AREA_RATIO)
 
+    keep_labels = [
+        i + 1 for i, area in enumerate(areas) if int(area) >= min_keep_area
+    ]
+
+    mask = np.isin(labels, keep_labels).astype(np.uint8) * 255
     result = cv2.bitwise_and(binary, binary, mask=mask)
 
     before = int(np.count_nonzero(binary))
@@ -273,8 +284,8 @@ def _isolate_main_cluster(binary: np.ndarray) -> np.ndarray:
     discarded = before - after
     if discarded > 0:
         logger.debug(
-            f"Cluster principal: kernel={k}px, descartados {discarded} px "
-            f"({100*discarded/max(before,1):.1f}%) de tinta lejana"
+            f"Aislamiento: kernel={k}px, {len(keep_labels)}/{num_labels-1} clusters "
+            f"conservados (área >= {min_keep_area}px), {discarded} px de tinta lejana descartados"
         )
     return result
 
