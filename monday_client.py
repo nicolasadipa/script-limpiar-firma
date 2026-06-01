@@ -433,3 +433,75 @@ def get_asset_download_url(asset_id: str, file_name: str) -> Optional[str]:
 
     logger.warning(f"No se pudo construir URL válida para asset {asset_id}")
     return None
+
+
+def upload_file_to_column(
+    item_id: str,
+    column_id: str,
+    file_path: str,
+    file_name: Optional[str] = None,
+) -> bool:
+    """
+    Sube un archivo a la columna de tipo "file" de un item en Monday.com.
+
+    Usa la mutación add_file_to_column via multipart/form-data según la
+    spec de file uploads de GraphQL.
+
+    Args:
+        item_id:   ID del item destino.
+        column_id: ID de la columna de archivo (ej: "archivo9" para Firma).
+        file_path: Ruta local al archivo a subir (el PNG procesado).
+        file_name: Nombre con el que aparecerá en Monday. Si None, usa el
+                   nombre del archivo en file_path.
+
+    Returns:
+        True si el upload fue exitoso, False si falló.
+    """
+    _require_env()
+
+    if not os.path.isfile(file_path):
+        logger.error(f"No existe el archivo a subir: {file_path}")
+        return False
+
+    file_name = file_name or os.path.basename(file_path)
+
+    mutation = (
+        "mutation ($file: File!) {"
+        f' add_file_to_column(item_id: {item_id}, column_id: "{column_id}", file: $file) {{'
+        "    id"
+        "  }"
+        "}"
+    )
+
+    try:
+        with open(file_path, "rb") as fp:
+            files = {
+                "query": (None, mutation),
+                "variables[file]": (file_name, fp, "image/png"),
+            }
+            headers = {"Authorization": MONDAY_API_TOKEN}
+
+            response = requests.post(
+                "https://api.monday.com/v2/file",
+                headers=headers,
+                files=files,
+                timeout=60,
+            )
+
+        response.raise_for_status()
+        data = response.json()
+
+        if "errors" in data:
+            err = data["errors"][0].get("message", "Error desconocido")
+            logger.error(f"Error subiendo archivo a Monday: {err}")
+            return False
+
+        asset_id = data.get("data", {}).get("add_file_to_column", {}).get("id")
+        logger.info(
+            f"Archivo subido a Monday (item={item_id} col={column_id} asset={asset_id})"
+        )
+        return True
+
+    except requests.exceptions.RequestException as exc:
+        logger.error(f"Error en upload a Monday: {exc}")
+        return False

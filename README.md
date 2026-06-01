@@ -2,6 +2,12 @@
 
 Sistema automático para procesar, limpiar y extraer firmas manuscritas de múltiples fuentes (PDF, JPG, PNG, DOCX, DOC) con transparencia real y calidad profesional.
 
+Se puede usar de tres formas:
+
+1. **CLI batch** (`python main.py`) — procesa una carpeta `input/` completa.
+2. **CLI Monday** (`python monday_processor.py "Nombre Docente"`) — descarga firma de Monday y procesa.
+3. **Web app (Next.js + FastAPI)** — UI en el navegador para subir archivos o seleccionar docentes desde Monday y subir el PNG procesado de vuelta. Ver [DEPLOY.md](./DEPLOY.md).
+
 ## Características
 
 - **Soporte multi-formato**: PDF, JPG, PNG, DOCX, DOC (con LibreOffice opcional para Word con firmas dibujadas).
@@ -138,9 +144,20 @@ Otsu corta automáticamente en el valle de esta distribución bimodal, y `THRESH
 ├── docx_converter.py      # Extracción de imágenes de Word (.docx/.doc)
 ├── main.py                # Batch sobre la carpeta input/
 ├── test_single.py         # Test individual
-├── monday_client.py       # Cliente GraphQL de Monday.com
-├── monday_processor.py    # Descarga firma de Monday y procesa
-├── requirements.txt       # Dependencias Python
+├── monday_client.py       # Cliente GraphQL de Monday.com (incluye upload_file_to_column)
+├── monday_processor.py    # Descarga firma de Monday y procesa (CLI)
+├── api/                   # Wrapper FastAPI sobre el pipeline (backend de la web app)
+│   ├── main.py
+│   └── requirements.txt
+├── web/                   # Frontend Next.js + Tailwind (deploy en Vercel)
+│   ├── app/
+│   ├── components/
+│   ├── lib/
+│   └── package.json
+├── Dockerfile             # Imagen para el backend Python (incluye LibreOffice)
+├── railway.json           # Config de deploy en Railway
+├── DEPLOY.md              # Guía paso a paso para Vercel + Railway
+├── requirements.txt       # Dependencias Python (CLI + API)
 ├── .env.example           # Plantilla de variables de entorno
 └── README.md
 ```

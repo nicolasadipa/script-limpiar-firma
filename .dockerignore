@@ -1,0 +1,20 @@
+# No copiar al contenedor:
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.gitignore
+.env
+.env.local
+input/
+output/
+logs/
+debug_output/
+*.log
+.DS_Store
+node_modules/
+web/.next/
+web/node_modules/
+web/out/

@@ -1,0 +1,7 @@
+# Dependencias específicas del wrapper FastAPI.
+# Las dependencias del procesador (OpenCV, PyMuPDF, etc.) están en
+# /requirements.txt en la raíz del repo y se instalan también en el Docker.
+
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+python-multipart>=0.0.9
