@@ -60,8 +60,9 @@ MIN_COMPONENT_WIDTH  = 2         # Ancho mínimo permitido
 MIN_COMPONENT_SIZE   = 95        # Área mínima (px²) para no considerar ruido residual
 
 # Detección del bounding-box de la firma
-MIN_SIGNATURE_AREA    = 180  # Área mínima de contorno para considerarse parte de la firma (px²)
-MAX_CENTROID_DISTANCE = 800  # Distancia máxima (px) al centroide promedio antes de descartar como ruido aislado
+MIN_SIGNATURE_AREA       = 180  # Área mínima de contorno para considerarse parte de la firma (px²)
+MAX_CENTROID_DISTANCE    = 800  # Distancia máxima absoluta (px) al centroide promedio — piso mínimo del filtro
+CENTROID_DISTANCE_RATIO  = 0.55 # Distancia máxima como fracción del lado largo de la imagen. Con 0.55 una firma puede ocupar todo el ancho útil sin que se filtren los extremos.
 
 # ---------------------------------------------------------------------------
 # Post-procesamiento

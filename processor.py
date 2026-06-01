@@ -315,8 +315,16 @@ def _find_signature_bbox(binary: np.ndarray) -> tuple[int, int, int, int] | None
     avg_x = sum(cx for cx, cy in centroids) / len(centroids)
     avg_y = sum(cy for cx, cy in centroids) / len(centroids)
 
-    # Filtra contornos demasiado lejos del centroide promedio (ruido aislado)
-    max_distance = config.MAX_CENTROID_DISTANCE
+    # Filtra contornos demasiado lejos del centroide promedio (ruido aislado).
+    # La distancia escala con el tamaño de la imagen: una firma en un PDF de
+    # CamScanner a 300 DPI mide ~2500px de ancho y sus partes (nombre, apellido,
+    # parafa) pueden estar a >1500px del centro. Un valor fijo deja afuera
+    # palabras enteras. Usamos MAX_CENTROID_DISTANCE como piso mínimo.
+    H, W = binary.shape[:2]
+    max_distance = max(
+        config.MAX_CENTROID_DISTANCE,
+        int(max(W, H) * config.CENTROID_DISTANCE_RATIO),
+    )
     filtered_bboxes = [
         bbox for bbox, (cx, cy) in zip(bboxes, centroids)
         if ((cx - avg_x) ** 2 + (cy - avg_y) ** 2) ** 0.5 <= max_distance
