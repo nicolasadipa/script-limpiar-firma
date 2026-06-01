@@ -228,6 +228,57 @@ def _clean_morphology(binary: np.ndarray) -> np.ndarray:
     return result
 
 
+def _isolate_main_cluster(binary: np.ndarray) -> np.ndarray:
+    """
+    Aísla el cluster principal de tinta y descarta cualquier marca lejana
+    (logos de CamScanner, sellos de esquina, marcas de agua, foliado).
+
+    Estrategia:
+      1. Dilata la binaria con un kernel proporcional al tamaño de imagen.
+         Eso conecta componentes cercanos entre sí (palabras separadas de
+         una misma firma) sin llegar a unir cosas en partes opuestas.
+      2. Encuentra el componente conectado más grande en la versión dilatada.
+      3. Usa ese componente como máscara para conservar solo la tinta que
+         pertenece al grupo principal.
+
+    Una firma típica tiene gaps internos de <100px entre palabras; el footer
+    de un escáner suele estar a 200-500px del cuerpo. Con un kernel de
+    ~5% del lado largo (125px en una imagen 2500x), los unimos lo primero
+    sin alcanzar lo segundo.
+    """
+    if not np.any(binary):
+        return binary
+
+    H, W = binary.shape[:2]
+    k = max(15, int(max(H, W) * config.CLUSTER_DILATION_RATIO))
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+
+    dilated = cv2.dilate(binary, kernel, iterations=1)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        dilated, connectivity=8
+    )
+    if num_labels < 2:
+        return binary
+
+    # Componente más grande excluyendo el fondo (label 0)
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    main_label = 1 + int(np.argmax(areas))
+    mask = (labels == main_label).astype(np.uint8) * 255
+
+    result = cv2.bitwise_and(binary, binary, mask=mask)
+
+    before = int(np.count_nonzero(binary))
+    after  = int(np.count_nonzero(result))
+    discarded = before - after
+    if discarded > 0:
+        logger.debug(
+            f"Cluster principal: kernel={k}px, descartados {discarded} px "
+            f"({100*discarded/max(before,1):.1f}%) de tinta lejana"
+        )
+    return result
+
+
 def _remove_artifacts(binary: np.ndarray) -> np.ndarray:
     """
     Elimina componentes conectados pequeños (ruido residual).
@@ -513,7 +564,15 @@ def process_signature(input_path: str, output_path: str) -> None:
     # ---- 8. Eliminación de artefactos y ruido ----------------------------
     binary_clean = _remove_artifacts(binary_clean)
 
-    # ---- 9. Detección del bounding-box de la firma -------------------------
+    # ---- 9. Aislar cluster principal (descarta logos/sellos/marcas) -----
+    # Conecta partes cercanas de la firma entre sí y descarta cualquier
+    # tinta espacialmente aislada (logo de CamScanner, sello en esquina,
+    # foliado del documento, etc.). Esto es más confiable que la detección
+    # de footer por línea horizontal, que falla cuando el escáner no
+    # imprime divisoria visible.
+    binary_clean = _isolate_main_cluster(binary_clean)
+
+    # ---- 10. Detección del bounding-box de la firma -----------------------
     bbox = _find_signature_bbox(binary_clean)
     if bbox is None:
         raise ValueError(

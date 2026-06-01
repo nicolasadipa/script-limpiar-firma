@@ -59,6 +59,9 @@ MIN_COMPONENT_HEIGHT = 2         # Altura mínima permitida
 MIN_COMPONENT_WIDTH  = 2         # Ancho mínimo permitido
 MIN_COMPONENT_SIZE   = 95        # Área mínima (px²) para no considerar ruido residual
 
+# Aislamiento del cluster principal (descarta logos/sellos espacialmente aislados)
+CLUSTER_DILATION_RATIO   = 0.05 # Fracción del lado largo usada como kernel de dilatación al buscar el cluster principal. Con 0.05 (≈125px en 2500x) une palabras separadas de una firma pero no llega al footer del escáner. Subir si la firma tiene partes muy separadas.
+
 # Detección del bounding-box de la firma
 MIN_SIGNATURE_AREA       = 180  # Área mínima de contorno para considerarse parte de la firma (px²)
 MAX_CENTROID_DISTANCE    = 800  # Distancia máxima absoluta (px) al centroide promedio — piso mínimo del filtro
