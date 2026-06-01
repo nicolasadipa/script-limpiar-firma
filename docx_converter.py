@@ -227,33 +227,57 @@ def _try_convert_to_pdf_and_extract(docx_path: str) -> np.ndarray:
     return None
 
 
+def _pick_signature_image(images: list[np.ndarray]) -> np.ndarray:
+    """
+    Elige la imagen que más probablemente sea la firma cuando el docx tiene
+    varias imágenes embebidas (logo institucional + firma, etc.).
+
+    Heurística: descartamos imágenes muy chicas (íconos) y entre las que
+    quedan priorizamos área grande y aspecto apaisado (típico de firma).
+    """
+    if len(images) == 1:
+        return images[0]
+
+    MIN_SIDE_PX = 100
+    candidates = [img for img in images if min(img.shape[:2]) >= MIN_SIDE_PX]
+    if not candidates:
+        candidates = images
+
+    def score(img: np.ndarray) -> float:
+        h, w = img.shape[:2]
+        area = h * w
+        aspect_bonus = 1.2 if w > h else 1.0
+        return area * aspect_bonus
+
+    best = max(candidates, key=score)
+    h, w = best.shape[:2]
+    logger.debug(
+        f"Imagen seleccionada de {len(images)} candidatas: {w}x{h} px"
+    )
+    return best
+
+
 def get_first_signature_from_docx(docx_path: str) -> np.ndarray:
     """
-    Extrae la primera imagen (asumida como firma) de un documento Word.
+    Extrae la firma de un documento Word.
 
-    Si no hay imágenes incrustadas, intenta convertir a PDF como fallback.
-
-    Args:
-        docx_path: Ruta al archivo .docx o .doc
-
-    Returns:
-        Array NumPy BGR de la primera imagen encontrada o documento convertido.
+    Estrategia:
+      1. Extrae todas las imágenes embebidas.
+      2. Si hay varias, elige la más probable (la más grande y apaisada).
+      3. Si no hay ninguna (firma dibujada como shape o InkML), convierte
+         el documento a PDF con LibreOffice como fallback.
 
     Raises:
         ValueError: Si no se puede procesar el documento.
-        RuntimeError: Si no se puede procesar el documento.
     """
-    # Intentar extraer imágenes incrustadas
     images = extract_images_from_docx(docx_path)
 
     if images:
-        # Retornar la primera imagen encontrada
-        return images[0]
+        return _pick_signature_image(images)
 
-    # FALLBACK: Intentar convertir el documento a PDF
     logger.info(
-        f"No hay imágenes incrustadas en '{docx_path}'. "
-        "Intentando convertir a PDF..."
+        f"No hay imágenes embebidas en '{docx_path}'. "
+        "Intentando convertir a PDF con LibreOffice..."
     )
 
     pdf_image = _try_convert_to_pdf_and_extract(docx_path)
@@ -262,12 +286,11 @@ def get_first_signature_from_docx(docx_path: str) -> np.ndarray:
         logger.info("Documento convertido a PDF exitosamente")
         return pdf_image
 
-    # Si todo falla
     raise ValueError(
         f"No se pudieron extraer imágenes del documento '{docx_path}'. "
-        "La firma no está incrustada como imagen. "
-        "Opciones: "
-        "1) Asegúrate de que la firma esté pegada como imagen en el Word "
-        "2) Convierte manualmente el .doc a .docx "
-        "3) Instala LibreOffice para conversión automática"
+        "La firma no está embebida como imagen. Opciones: "
+        "1) Pegá la firma como imagen en el Word, "
+        "2) Convertí manualmente el .doc a .docx, "
+        "3) Instalá LibreOffice (brew install --cask libreoffice en macOS) "
+        "para conversión automática."
     )

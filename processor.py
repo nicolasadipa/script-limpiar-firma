@@ -38,19 +38,38 @@ logger = setup_logger()
 
 def _remove_scanner_footer(bgr: np.ndarray) -> np.ndarray:
     """
-    Detecta y elimina región inferior con logo de escáner (CamScanner, etc.).
+    Detecta y elimina el footer de escáner (CamScanner y similares) buscando
+    una línea horizontal divisoria en el último 15% de la imagen.
+
+    A diferencia de cortar siempre N píxeles fijos, esto:
+      - No corta nada si la firma NO viene de un escáner con footer.
+      - Si hay footer, lo corta justo en la línea divisoria (no encima de
+        la firma ni dejando logo abajo).
     """
     H, W = bgr.shape[:2]
 
     if H < 300:
         return bgr
 
-    # Remover últimos 80 píxeles (donde va el logo CamScanner)
-    cutoff_px = min(80, H // 12)
-    bgr_cropped = bgr[:H - cutoff_px, :]
+    search_start = int(H * 0.85)
+    search_zone  = bgr[search_start:, :]
+    gray_zone    = cv2.cvtColor(search_zone, cv2.COLOR_BGR2GRAY)
 
-    logger.debug(f"Footer removido: {H}px → {H - cutoff_px}px")
-    return bgr_cropped
+    # Detectar bordes horizontales fuertes en la zona inferior
+    edges = cv2.Canny(gray_zone, 50, 150)
+    horizontal_strength = np.sum(edges, axis=1)  # suma por fila
+
+    # Una "línea divisoria" cubre >60% del ancho como borde fuerte
+    line_threshold = W * 255 * 0.60
+    candidate_rows = np.where(horizontal_strength > line_threshold)[0]
+
+    if candidate_rows.size > 0:
+        cutoff_y = search_start + int(candidate_rows[0])
+        logger.debug(f"Footer detectado en y={cutoff_y} (H original={H})")
+        return bgr[:cutoff_y, :]
+
+    logger.debug("Sin footer de escáner detectado, no se recorta")
+    return bgr
 
 
 def _correct_illumination(bgr: np.ndarray) -> np.ndarray:
@@ -124,38 +143,33 @@ def _detect_ink_color(bgr_corrected: np.ndarray) -> str:
     """
     Detecta automáticamente si la firma es de tinta AZUL o NEGRA.
 
-    Analiza los píxeles oscuros y cuenta cuántos son azules.
-    Si > 30% de píxeles oscuros son azules → AZUL
-    Si < 30% → NEGRA
+    Analiza los píxeles oscuros (gray < DARK_PIXEL_MAX_GRAY) y mide qué
+    fracción de ellos cae en el rango azul de HSV. Si supera BLUE_INK_RATIO
+    es tinta azul, si no, negra.
 
     Returns: "blue" o "black"
     """
-    hsv = cv2.cvtColor(bgr_corrected, cv2.COLOR_BGR2HSV)
+    hsv  = cv2.cvtColor(bgr_corrected, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(bgr_corrected, cv2.COLOR_BGR2GRAY)
+    h, s, _ = cv2.split(hsv)
 
-    h, s, v = cv2.split(hsv)
+    mask_dark = gray < config.DARK_PIXEL_MAX_GRAY
+    mask_blue_ink = (
+        (h >= config.BLUE_INK_HUE_MIN)
+        & (h <= config.BLUE_INK_HUE_MAX)
+        & (s >  config.BLUE_INK_MIN_SAT)
+        & mask_dark
+    )
 
-    # Detectar píxeles oscuros (potencial tinta)
-    mask_dark = gray < 150
+    dark_count = int(np.sum(mask_dark))
+    blue_count = int(np.sum(mask_blue_ink))
+    blue_ratio = (blue_count / dark_count) if dark_count > 0 else 0.0
 
-    # Detectar píxeles azules oscuros (H: 90-140, S > 30)
-    mask_blue_ink = (h >= 90) & (h <= 140) & (s > 30) & mask_dark
-
-    # Calcular proporción de azul en píxeles oscuros
-    dark_count = np.sum(mask_dark)
-    blue_count = np.sum(mask_blue_ink)
-
-    if dark_count > 0:
-        blue_ratio = blue_count / dark_count
-    else:
-        blue_ratio = 0
-
-    logger.debug(f"Detección de color: azul={blue_ratio:.1%}, oscuros={dark_count}")
-
-    # Decidir: si más del 30% son azules → es azul
-    ink_color = "blue" if blue_ratio > 0.30 else "black"
-    logger.info(f"Tinta detectada: {ink_color.upper()}")
-
+    ink_color = "blue" if blue_ratio > config.BLUE_INK_RATIO else "black"
+    logger.info(
+        f"Tinta detectada: {ink_color.upper()} "
+        f"(azul_ratio={blue_ratio:.1%}, oscuros={dark_count})"
+    )
     return ink_color
 
 
@@ -166,37 +180,27 @@ def _detect_ink_color(bgr_corrected: np.ndarray) -> str:
 
 def _binarize(tinta_map: np.ndarray, ink_color: str) -> np.ndarray:
     """
-    Binarización simple y limpia sobre el mapa de tinta óptimo.
+    Binariza el mapa de tinta. Resultado: firma=blanco(255), fondo=negro(0).
 
-    El mapa de tinta ya tiene:
-    - Firma resaltada (blanco/255)
-    - Ruido atenuado (por bilateral filter)
-    - Bordes preservados (no borrados por suavizado)
-
-    Solo aplicamos threshold adaptativo sobre esta base limpia.
-
-    Resultado: firma=blanco(255), fondo=negro(0)
+    En el mapa de tinta la firma ya tiene valores altos (saturación HSV para
+    azul, canal R invertido para negra) y el fondo tiene valores bajos. Esa
+    distribución bimodal limpia se separa muy bien con Otsu. Bajamos el corte
+    de Otsu por THRESH_C para recuperar trazos finos sin tomar ruido de fondo.
     """
-    logger.debug(f"Binarizando con canal óptimo para tinta {ink_color.upper()}...")
-
-    binary = cv2.adaptiveThreshold(
-        tinta_map,
-        maxValue=255,
-        adaptiveMethod=cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        thresholdType=cv2.THRESH_BINARY,
-        blockSize=config.THRESH_BLOCK_SIZE,
-        C=config.THRESH_C,
+    otsu_thresh, _ = cv2.threshold(
+        tinta_map, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
-    # Invertir: firma=blanco(255), fondo=negro(0)
-    binary_inverted = cv2.bitwise_not(binary)
+    threshold = max(int(otsu_thresh) - config.THRESH_C, config.MIN_INK_THRESHOLD)
+    _, binary = cv2.threshold(tinta_map, threshold, 255, cv2.THRESH_BINARY)
 
+    ink_pct = 100.0 * np.count_nonzero(binary) / binary.size
     logger.debug(
-        f"Binarización: {np.sum(binary_inverted > 0)} píxeles de tinta "
-        f"({100*np.sum(binary_inverted > 0)/(tinta_map.shape[0]*tinta_map.shape[1]):.1f}% de imagen)"
+        f"Binarización ({ink_color}): otsu={otsu_thresh:.0f} "
+        f"final={threshold} tinta={ink_pct:.1f}%"
     )
 
-    return binary_inverted
+    return binary
 
 
 def _clean_morphology(binary: np.ndarray) -> np.ndarray:
@@ -311,9 +315,8 @@ def _find_signature_bbox(binary: np.ndarray) -> tuple[int, int, int, int] | None
     avg_x = sum(cx for cx, cy in centroids) / len(centroids)
     avg_y = sum(cy for cx, cy in centroids) / len(centroids)
 
-    # Filtrar contornos que estén a más de 800 px de distancia del centroide promedio
-    # (mantiene toda la firma incluso si está dispersa)
-    max_distance = 800
+    # Filtra contornos demasiado lejos del centroide promedio (ruido aislado)
+    max_distance = config.MAX_CENTROID_DISTANCE
     filtered_bboxes = [
         bbox for bbox, (cx, cy) in zip(bboxes, centroids)
         if ((cx - avg_x) ** 2 + (cy - avg_y) ** 2) ** 0.5 <= max_distance
@@ -481,27 +484,20 @@ def process_signature(input_path: str, output_path: str) -> None:
     # ---- 2. Corrección de iluminación --------------------------------------
     bgr_corrected = _correct_illumination(bgr)
 
-    # ---- 3. Escala de grises -----------------------------------------------
-    gray = cv2.cvtColor(bgr_corrected, cv2.COLOR_BGR2GRAY)
+    # ---- 3. Detección automática de color de tinta -------------------------
+    ink_color = _detect_ink_color(bgr_corrected)
 
-    # ---- 4. Eliminación de ruido -------------------------------------------
-    gray_clean = cv2.fastNlMeansDenoising(
-        gray,
-        h=config.DENOISE_H,
-        templateWindowSize=config.DENOISE_TEMPLATE_WS,
-        searchWindowSize=config.DENOISE_SEARCH_WS,
-    )
+    # ---- 4. Extracción del canal con mejor contraste para esa tinta -------
+    # Azul → saturación HSV, Negra → canal R invertido.
+    # Esto separa la firma del fondo MUCHO mejor que escala de grises cuando
+    # el papel tiene tonos parecidos a la tinta.
+    tinta_map = _extract_ink_channel(bgr_corrected, ink_color)
 
-    # ---- 5. Binarización ---------------------------------------------------
-    binary = cv2.adaptiveThreshold(
-        gray_clean,
-        maxValue=255,
-        adaptiveMethod=cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        thresholdType=cv2.THRESH_BINARY,
-        blockSize=config.THRESH_BLOCK_SIZE,
-        C=config.THRESH_C,
-    )
-    binary = cv2.bitwise_not(binary)
+    # ---- 5. Eliminación de ruido sobre el mapa de tinta -------------------
+    tinta_clean = _denoise_tinta_map(tinta_map)
+
+    # ---- 6. Binarización (Otsu sobre mapa de tinta) -----------------------
+    binary = _binarize(tinta_clean, ink_color)
 
     # ---- 7. Limpieza morfológica -------------------------------------------
     binary_clean = _clean_morphology(binary)

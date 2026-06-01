@@ -22,6 +22,20 @@ MONDAY_API_TOKEN = os.getenv("MONDAY_API_TOKEN")
 MONDAY_BOARD_ID = os.getenv("MONDAY_BOARD_ID")
 
 
+def _require_env() -> None:
+    """Valida que las variables de entorno necesarias estén configuradas."""
+    missing = []
+    if not MONDAY_API_TOKEN:
+        missing.append("MONDAY_API_TOKEN")
+    if not MONDAY_BOARD_ID:
+        missing.append("MONDAY_BOARD_ID")
+    if missing:
+        raise RuntimeError(
+            f"Faltan variables de entorno: {', '.join(missing)}. "
+            "Copiá .env.example a .env y completá los valores."
+        )
+
+
 def _make_request(query: str, variables: Optional[dict] = None) -> dict:
     """
     Ejecuta una consulta GraphQL contra Monday.com API.
@@ -36,11 +50,7 @@ def _make_request(query: str, variables: Optional[dict] = None) -> dict:
     Raises:
         RuntimeError: Si la API retorna un error.
     """
-    if not MONDAY_API_TOKEN:
-        raise RuntimeError(
-            "MONDAY_API_TOKEN no está configurado en .env. "
-            "Añade tu token de Monday.com."
-        )
+    _require_env()
 
     headers = {
         "Authorization": MONDAY_API_TOKEN,
