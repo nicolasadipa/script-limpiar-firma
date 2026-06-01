@@ -1,0 +1,29 @@
+# ============================================================
+# requirements.txt — Dependencias del procesador de firmas
+# ============================================================
+#
+# Instalación recomendada (entorno virtual):
+#   python -m venv venv
+#   venv\Scripts\activate        (Windows)
+#   source venv/bin/activate     (Linux/macOS)
+#   pip install -r requirements.txt
+# ============================================================
+
+# Procesamiento de imágenes (núcleo del pipeline)
+opencv-python>=4.9.0
+
+# Conversión de PDF a imagen
+PyMuPDF>=1.24.0
+
+# Barra de progreso en consola
+tqdm>=4.66.0
+
+# NumPy (dependencia implícita de OpenCV, declarada explícitamente)
+numpy>=1.26.0
+
+# Integración con Monday.com
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Procesamiento de documentos Word
+python-docx>=0.8.11

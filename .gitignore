@@ -1,0 +1,42 @@
+# Entorno virtual
+venv/
+env/
+.venv
+
+# Variables de entorno
+.env
+.env.local
+.env.*.local
+
+# Carpetas de datos (temporales)
+input/
+output/
+logs/
+debug_output/
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Archivos de configuración local
+*.local.json
+settings.local.json
