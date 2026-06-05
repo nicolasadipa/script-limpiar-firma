@@ -60,9 +60,13 @@ THRESH_C            = 15     # Margen restado del corte Otsu (sube = capta más;
 MIN_INK_THRESHOLD   = 25     # Piso absoluto del umbral (evita tomar ruido cuando el Otsu es muy bajo)
 
 # Morfología (apertura solamente)
-MORPH_KERNEL_SIZE   = 1          # 1 = 3x3 kernel
-MORPH_ITERATIONS    = 1          # 1 iteración
-MORPH_CLOSE_ENABLE  = False      # Cierre deshabilitado por defecto
+MORPH_KERNEL_SIZE      = 1       # 1 = 3x3 kernel
+MORPH_ITERATIONS       = 1       # 1 iteración
+MORPH_CLOSE_ENABLE     = False   # Cierre deshabilitado por defecto
+MORPH_MIN_THICKNESS_PX = 4.0     # Si el grosor medio de trazo es menor, se omite
+                                 # la apertura (rompería líneas finas de firmas
+                                 # digitales / lapicera fina). Escaneos normales
+                                 # tienen trazos más gruesos y sí se abren.
 
 # Eliminación de artefactos por componentes conectados
 MIN_COMPONENT_HEIGHT = 2         # Altura mínima permitida
@@ -100,6 +104,15 @@ TEXT_LINE_WIDTH_RATIO   = 0.30  # Extensión horizontal mínima de una línea (f
 TEXT_BASELINE_FLAT_RATIO= 0.6   # Planitud: std de baseline <= este factor * altura de letra
 TEXT_MIN_CHARS_PER_LINE = 3     # Mínimo de componentes para que una línea sea "fuerte"
 TEXT_MIN_LINES          = 2     # Mínimo de líneas fuertes paralelas para confirmar el bloque
+
+# Eliminación de ETIQUETAS de texto impreso SEPARADAS de la firma (títulos de
+# documento, encabezados tipo "FIRMA DIGITAL"). Caso seguro y acotado: solo se
+# tocan filas de letras chicas, uniformes y alineadas, lejanas al cuerpo de la
+# firma. NO toca texto que se solape con la firma (ese caso sigue sin resolver).
+LABEL_MIN_GAP_RATIO      = 0.05  # Distancia mínima al cuerpo de la firma (fracción lado largo)
+LABEL_MIN_CHARS          = 5     # Mínimo de letras en la fila para considerarla etiqueta
+LABEL_HEIGHT_CV          = 0.30  # Uniformidad de altura (std/media); impreso es muy uniforme
+LABEL_BASELINE_FLAT_RATIO= 0.5   # Planitud de baseline (std <= factor * altura de letra)
 
 # Retoque final — eliminación de manchitas aisladas (bleed-through, borrones sueltos)
 SPECK_MAX_AREA_RATIO  = 0.015 # Una manchita mide < 1.5% del cuerpo de la firma

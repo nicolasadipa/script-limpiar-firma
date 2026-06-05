@@ -264,7 +264,24 @@ def _clean_morphology(binary: np.ndarray) -> np.ndarray:
     Limpieza morfológica: apertura + cierre opcional.
     - Apertura: elimina ruido pequeño sin modificar trazos gruesos.
     - Cierre: conecta trazos separados, rellena espacios pequeños.
+
+    La apertura está pensada para escaneos ruidosos. En firmas digitales o de
+    lapicera muy fina (líneas limpias de 2-3px), erosiona y ROMPE el trazo en
+    pedazos. Por eso, si el grosor medio del trazo está por debajo de
+    MORPH_MIN_THICKNESS_PX, se omite la apertura: la imagen ya es limpia y no
+    hay ruido que justificar perder la continuidad de la firma.
     """
+    if np.any(binary):
+        dt    = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+        ridge = dt[dt > 0.5]
+        mean_thick = float(np.mean(ridge)) * 2.0 if ridge.size else 0.0
+        if mean_thick < config.MORPH_MIN_THICKNESS_PX:
+            logger.debug(
+                f"Trazo fino ({mean_thick:.1f}px < {config.MORPH_MIN_THICKNESS_PX}px): "
+                f"se omite la apertura morfológica para no fragmentar la firma"
+            )
+            return binary
+
     k = max(1, config.MORPH_KERNEL_SIZE)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
 
@@ -533,6 +550,95 @@ def _remove_printed_text_block(binary: np.ndarray) -> np.ndarray:
         logger.debug(
             f"Fix E: bloque de texto impreso eliminado "
             f"({n_lines} líneas, {len(to_remove)} componentes)"
+        )
+    return binary
+
+
+def _remove_separated_text_labels(binary: np.ndarray) -> np.ndarray:
+    """
+    Elimina ETIQUETAS de texto impreso que están SEPARADAS de la firma (títulos
+    de documento tipo "FIRMA DIGITAL", encabezados, pies), sin riesgo para los
+    trazos manuscritos.
+
+    A diferencia del texto impreso que se SOLAPA con la firma (caso difícil, no
+    resuelto), una etiqueta separada se reconoce sin ambigüedad: es una fila de
+    muchas letras CHICAS, de altura UNIFORME, apoyadas en una baseline PLANA, y
+    a buena DISTANCIA del cuerpo de la firma. Una firma manuscrita nunca produce
+    5+ componentes sueltos de igual altura alineados en una recta horizontal.
+
+    Solo se consideran componentes lejanos al componente mayor (la firma), así
+    que esta función jamás toca algo pegado o encima de la firma.
+    """
+    if not np.any(binary):
+        return binary
+
+    H, W = binary.shape[:2]
+    long_side = max(H, W)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    if num_labels < 1 + config.LABEL_MIN_CHARS:
+        return binary
+
+    areas   = stats[1:, cv2.CC_STAT_AREA]
+    largest = int(np.argmax(areas)) + 1
+    a_max   = int(areas.max())
+    min_gap = config.LABEL_MIN_GAP_RATIO * long_side
+    max_h   = config.TEXT_MAX_H_RATIO * long_side
+
+    # Distancia de cada píxel al cuerpo de la firma (componente mayor)
+    inv = (labels != largest).astype(np.uint8)
+    dist_to_main = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+
+    # Candidatos: componentes de tamaño de letra, separados de la firma
+    cands = []  # (label, x, y, w, h)
+    for i in range(1, num_labels):
+        if i == largest:
+            continue
+        x, y, bw, bh, area = stats[i]
+        if area < config.MIN_COMPONENT_SIZE:
+            continue
+        if area >= a_max * config.TEXT_MAX_AREA_RATIO or bh > max_h:
+            continue  # trazo grande de la firma → protegido
+        if float(dist_to_main[labels == i].min()) < min_gap:
+            continue  # pegado/cerca de la firma → no se toca
+        cands.append((i, int(x), int(y), int(bw), int(bh)))
+
+    if len(cands) < config.LABEL_MIN_CHARS:
+        return binary
+
+    # Agrupar candidatos en filas por su centro vertical
+    median_h = float(np.median([c[4] for c in cands]))
+    cands.sort(key=lambda c: c[2] + c[4] / 2.0)
+    rows = [[cands[0]]]
+    for c in cands[1:]:
+        cy      = c[2] + c[4] / 2.0
+        prev_cy = rows[-1][-1][2] + rows[-1][-1][4] / 2.0
+        if cy - prev_cy <= median_h:
+            rows[-1].append(c)
+        else:
+            rows.append([c])
+
+    # Una fila es "etiqueta impresa" si tiene varias letras de altura uniforme
+    # sobre una baseline plana.
+    to_remove = []
+    for row in rows:
+        if len(row) < config.LABEL_MIN_CHARS:
+            continue
+        hs = np.array([c[4] for c in row], dtype=np.float64)
+        h_cv = float(hs.std() / hs.mean()) if hs.mean() > 0 else 1.0
+        baselines = np.array([c[2] + c[4] for c in row], dtype=np.float64)
+        mh = float(np.median(hs))
+        if (h_cv <= config.LABEL_HEIGHT_CV
+                and float(baselines.std()) <= config.LABEL_BASELINE_FLAT_RATIO * mh):
+            to_remove.extend(c[0] for c in row)
+
+    if to_remove:
+        binary = binary.copy()
+        binary[np.isin(labels, to_remove)] = 0
+        logger.debug(
+            f"Etiqueta(s) de texto impreso separada(s) eliminada(s) "
+            f"({len(to_remove)} componentes)"
         )
     return binary
 
@@ -959,6 +1065,11 @@ def process_signature(input_path: str, output_path: str) -> None:
     # _remove_printed_text_block disponible pero fuera del pipeline hasta tener
     # un método robusto (p. ej. detector de texto por OCR/ML). Ver roadmap.
     # binary_clean = _remove_printed_text_block(binary_clean)
+
+    # ---- 8.8. Quitar etiquetas de texto impreso SEPARADAS de la firma ------
+    # (títulos tipo "FIRMA DIGITAL", encabezados). Caso seguro: solo toca filas
+    # de letras uniformes lejanas al cuerpo de la firma, nunca texto solapado.
+    binary_clean = _remove_separated_text_labels(binary_clean)
 
     # ---- 9. Aislar cluster principal (descarta logos/sellos/marcas) -----
     # Conecta partes cercanas de la firma entre sí y descarta cualquier
