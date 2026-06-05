@@ -36,6 +36,62 @@ logger = setup_logger()
 # Funciones auxiliares
 # ---------------------------------------------------------------------------
 
+def _flatten_to_bgr(img: np.ndarray) -> np.ndarray:
+    """
+    Normaliza cualquier imagen leída a BGR de 3 canales, componiendo sobre
+    fondo BLANCO si trae canal alfa.
+
+    Antes el loader usaba cv2.IMREAD_COLOR, que descarta el alfa y aplana el
+    fondo transparente sobre NEGRO. Para una firma exportada como PNG con
+    transparencia (fondo transparente, trazos opacos) eso invertía por completo
+    el mapa de tinta: el canal R quedaba bajo en toda la imagen y la
+    binarización detectaba ~98% de la imagen como "tinta" → salida inservible.
+
+    Componer sobre blanco preserva el color real del trazo (negro o azul) y
+    deja el fondo claro, que es justo lo que el resto del pipeline espera.
+    """
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+
+    if img.shape[2] == 4:
+        bgr   = img[:, :, :3].astype(np.float32)
+        alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+        white = np.full_like(bgr, 255.0)
+        comp  = bgr * alpha + white * (1.0 - alpha)
+        transparent_pct = 100.0 * np.count_nonzero(img[:, :, 3] < 10) / img[:, :, 3].size
+        logger.debug(
+            f"Canal alfa detectado: compuesto sobre blanco "
+            f"({transparent_pct:.1f}% del área era transparente)"
+        )
+        return comp.astype(np.uint8)
+
+    return img
+
+
+def _normalize_resolution(bgr: np.ndarray) -> np.ndarray:
+    """
+    Lleva el lado largo de la imagen a WORK_LONG_SIDE_PX cuando es más chica,
+    para que el grosor de trazo caiga en el rango para el que está calibrado el
+    resto del pipeline. Solo escala HACIA ARRIBA (interpolación cúbica): las
+    imágenes grandes se devuelven sin tocar, así no se altera el caso que hoy
+    ya funciona.
+    """
+    H, W      = bgr.shape[:2]
+    long_side = max(H, W)
+    target    = config.WORK_LONG_SIDE_PX
+
+    if long_side >= target:
+        return bgr
+
+    scale = target / long_side
+    new_W = int(round(W * scale))
+    new_H = int(round(H * scale))
+    logger.debug(
+        f"Normalización de resolución: {W}x{H} → {new_W}x{new_H} (x{scale:.2f})"
+    )
+    return cv2.resize(bgr, (new_W, new_H), interpolation=cv2.INTER_CUBIC)
+
+
 def _remove_scanner_footer(bgr: np.ndarray) -> np.ndarray:
     """
     Detecta y elimina el footer de escáner (CamScanner y similares) buscando
@@ -226,6 +282,310 @@ def _clean_morphology(binary: np.ndarray) -> np.ndarray:
         )
 
     return result
+
+
+def _remove_straight_lines(binary: np.ndarray) -> np.ndarray:
+    """
+    Fix D — Elimina líneas rectas impresas (filetes de documento, bordes de
+    tabla, subrayados hechos con regla) que quedan cerca de la firma.
+
+    Para cada componente conectado mide, vía PCA sobre sus píxeles:
+      - elongación (largo/grosor): una regla supera 60; un trazo de firma ~5,
+        y hasta ~30 en un floreo recto. El umbral alto evita falsos positivos.
+      - largo absoluto: debe cubrir una fracción grande de la imagen.
+      - grosor medio: una regla es fina.
+      - orientación del eje principal: las reglas impresas son horizontales o
+        verticales; se exige alineación a los ejes para NO tocar trazos
+        diagonales de la firma aunque sean rectos.
+    Solo se elimina el componente que cumple TODAS las condiciones.
+    """
+    if not np.any(binary):
+        return binary
+
+    H, W = binary.shape[:2]
+    long_side = max(H, W)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    if num_labels < 2:
+        return binary
+
+    dt = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    min_len   = config.LINE_MIN_LEN_RATIO * long_side
+    max_thick = config.LINE_MAX_THICK_RATIO * long_side
+    tol       = config.LINE_AXIS_TOL_DEG
+
+    to_remove = []
+    for i in range(1, num_labels):
+        if stats[i, cv2.CC_STAT_AREA] < config.MIN_COMPONENT_SIZE:
+            continue
+
+        comp = labels == i
+        ys, xs = np.where(comp)
+        pts = np.column_stack([xs, ys]).astype(np.float32)
+        mean = pts.mean(axis=0)
+        cov  = np.cov((pts - mean).T)
+        evals, evecs = np.linalg.eigh(cov)          # ascendente
+        l_small = max(float(evals[0]), 1e-6)
+        l_large = max(float(evals[1]), 1e-6)
+
+        elong  = (l_large / l_small) ** 0.5
+        length = (l_large ** 0.5) * 4.0
+        thick  = float(dt[comp].mean()) * 2.0
+
+        # Ángulo del eje principal respecto de la horizontal (0-180)
+        vx, vy = evecs[0, 1], evecs[1, 1]
+        ang = abs(np.degrees(np.arctan2(vy, vx))) % 180.0
+        axis_aligned = (
+            ang < tol or ang > 180.0 - tol or abs(ang - 90.0) < tol
+        )
+
+        if (elong >= config.LINE_ELONG_MIN and length >= min_len
+                and thick <= max_thick and axis_aligned):
+            to_remove.append(i)
+
+    if to_remove:
+        binary = binary.copy()
+        binary[np.isin(labels, to_remove)] = 0
+        logger.debug(
+            f"Fix D: {len(to_remove)} línea(s) recta(s) impresa(s) eliminada(s)"
+        )
+    return binary
+
+
+def _remove_solid_blobs(binary: np.ndarray) -> np.ndarray:
+    """
+    Fix C — Elimina manchas/sombras sólidas (sombra de escaneo, borrón pegado
+    al borde del papel) que se binarizan como tinta.
+
+    El discriminador clave es el GROSOR MEDIO del componente, medido con el
+    distance transform: un trazo de lapicera es fino (pocos px de grosor medio
+    aunque la firma sea grande), mientras que una sombra rellena tiene un grosor
+    medio mucho mayor (en el Caso 3, 68px vs 14px de la firma). Se exige además
+    que el componente toque el borde de la imagen, que es donde aparecen las
+    sombras de escaneo, para no tocar nunca un elemento central de la firma.
+    """
+    if not np.any(binary):
+        return binary
+
+    H, W = binary.shape[:2]
+    long_side = max(H, W)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    if num_labels < 2:
+        return binary
+
+    dt = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    thick_thresh = config.BLOB_THICK_RATIO * long_side
+
+    to_remove = []
+    for i in range(1, num_labels):
+        x, y, bw, bh, area = stats[i]
+        if area < config.BLOB_MIN_AREA:
+            continue
+
+        comp  = labels == i
+        thick = float(dt[comp].mean()) * 2.0
+        touches_border = (
+            x <= 1 or y <= 1 or (x + bw) >= (W - 1) or (y + bh) >= (H - 1)
+        )
+
+        if thick >= thick_thresh and (touches_border or not config.BLOB_REQUIRE_BORDER):
+            to_remove.append(i)
+
+    if to_remove:
+        binary = binary.copy()
+        binary[np.isin(labels, to_remove)] = 0
+        logger.debug(
+            f"Fix C: {len(to_remove)} mancha(s)/sombra(s) sólida(s) eliminada(s)"
+        )
+    return binary
+
+
+def _component_elongation(comp_mask: np.ndarray) -> float:
+    """Elongación (largo/grosor) de un componente vía PCA sobre sus píxeles."""
+    ys, xs = np.where(comp_mask)
+    if xs.size < 2:
+        return 1.0
+    pts  = np.column_stack([xs, ys]).astype(np.float32)
+    cov  = np.cov((pts - pts.mean(axis=0)).T)
+    evals = np.linalg.eigvalsh(cov)
+    l_small = max(float(evals[0]), 1e-6)
+    l_large = max(float(evals[1]), 1e-6)
+    return (l_large / l_small) ** 0.5
+
+
+def _remove_printed_text_block(binary: np.ndarray) -> np.ndarray:
+    """
+    Fix E — Elimina bloques de TEXTO IMPRESO (nombre, cargo, RUT, etc.) que
+    acompañan a la firma, sin tocar los trazos manuscritos.
+
+    No se puede usar la varianza de grosor de trazo: cuando el texto está en
+    una fuente cursiva/script, su grosor es tan uniforme y parecido al de la
+    firma que ese discriminador falla. Lo que SÍ separa al texto impreso es su
+    ESTRUCTURA: varias líneas horizontales paralelas, cada una formada por
+    muchos componentes chicos que comparten una misma baseline (borde inferior).
+    Una firma manuscrita es diagonal/dispersa y no genera baselines largas.
+
+    Algoritmo:
+      1. Toma como "candidatos a carácter" los componentes de tamaño de texto
+         (ni los trazos gigantes ni las líneas largas de la firma, excluidos por
+         área y elongación).
+      2. Vota el borde inferior (baseline) de cada candidato, ponderado por su
+         ancho, en un histograma vertical.
+      3. Una "línea de texto" es una baseline cuyo ancho acumulado supera una
+         fracción del ancho de la imagen. Si hay al menos TEXT_MIN_LINES líneas,
+         es un bloque de texto impreso.
+      4. Elimina los candidatos que caen sobre una línea detectada. Los trazos
+         grandes de la firma quedan protegidos por las guardas de área/elongación
+         y nunca se eliminan, aunque crucen el bloque de texto.
+    """
+    if not np.any(binary):
+        return binary
+
+    H, W = binary.shape[:2]
+    long_side = max(H, W)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    if num_labels < 1 + config.TEXT_MIN_CHARS:
+        return binary
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    a_max = int(areas.max())
+    max_char_area = a_max * config.TEXT_MAX_AREA_RATIO
+    max_char_h    = config.TEXT_MAX_H_RATIO * long_side
+
+    # 1. Candidatos a carácter (tamaño de texto, no trazos de firma)
+    chars = []  # (label, x, y, w, h)
+    for i in range(1, num_labels):
+        x, y, bw, bh, area = stats[i]
+        if area < config.MIN_COMPONENT_SIZE:
+            continue
+        if area >= max_char_area or bh > max_char_h:
+            continue  # trazo grande de la firma → protegido
+        if _component_elongation(labels == i) > config.TEXT_MAX_ELONG:
+            continue  # trazo largo/fino de la firma → protegido
+        chars.append((i, int(x), int(y), int(bw), int(bh)))
+
+    if len(chars) < config.TEXT_MIN_CHARS:
+        return binary
+
+    # 2. Agrupar candidatos en líneas por su centro vertical (cy). Se separa en
+    #    una línea nueva cuando el salto de cy supera la altura mediana de texto.
+    median_h = float(np.median([c[4] for c in chars]))
+    chars_sorted = sorted(chars, key=lambda c: c[2] + c[4] / 2.0)
+    groups = [[chars_sorted[0]]]
+    for c in chars_sorted[1:]:
+        cy      = c[2] + c[4] / 2.0
+        prev_cy = groups[-1][-1][2] + groups[-1][-1][4] / 2.0
+        if cy - prev_cy <= median_h:
+            groups[-1].append(c)
+        else:
+            groups.append([c])
+
+    # 3. Métricas por línea. La PLANITUD de baseline se mide solo con las letras
+    #    altas del grupo (las que se apoyan en la baseline), ignorando tildes y
+    #    puntos que están más arriba y distorsionarían la medida.
+    def line_metrics(g):
+        x0     = min(c[1] for c in g)
+        x1     = max(c[1] + c[3] for c in g)
+        extent = x1 - x0
+        max_h  = max(c[4] for c in g)
+        tall   = [c for c in g if c[4] >= 0.5 * max_h] or g
+        baselines = [c[2] + c[4] for c in tall]
+        bl_std = float(np.std(baselines))
+        mh     = float(np.median([c[4] for c in tall]))
+        return extent, bl_std, mh
+
+    # Una línea es "texto impreso" si es ANCHA (cubre buena parte del ancho) y
+    # su baseline es PLANA. Una palabra manuscrita en diagonal tiene baseline
+    # inclinada (bl_std alto) y queda descartada.
+    text_lines = []  # (group, mh, count)
+    for g in groups:
+        extent, bl_std, mh = line_metrics(g)
+        if (extent >= config.TEXT_LINE_WIDTH_RATIO * W
+                and bl_std <= config.TEXT_BASELINE_FLAT_RATIO * mh):
+            text_lines.append((g, mh, len(g)))
+
+    # Confirmación del bloque: se exige al menos TEXT_MIN_LINES líneas fuertes
+    # (con varios componentes) de altura parecida. Una firma no genera varias
+    # líneas planas, anchas y paralelas; un bloque impreso sí.
+    strong = [t for t in text_lines if t[2] >= config.TEXT_MIN_CHARS_PER_LINE]
+    if len(strong) < config.TEXT_MIN_LINES:
+        return binary
+
+    ref_mh = float(np.median([mh for (_g, mh, _n) in strong]))
+
+    # Se eliminan todas las líneas de texto cuya altura concuerda con el bloque
+    # (incluye líneas cortas como un "Cargo" de pocas palabras).
+    to_remove = []
+    n_lines = 0
+    for (g, mh, _n) in text_lines:
+        if 0.5 * ref_mh <= mh <= 1.8 * ref_mh:
+            to_remove.extend(c[0] for c in g)
+            n_lines += 1
+
+    if to_remove:
+        binary = binary.copy()
+        binary[np.isin(labels, to_remove)] = 0
+        logger.debug(
+            f"Fix E: bloque de texto impreso eliminado "
+            f"({n_lines} líneas, {len(to_remove)} componentes)"
+        )
+    return binary
+
+
+def _remove_isolated_specks(binary: np.ndarray) -> np.ndarray:
+    """
+    Retoque final — elimina manchitas/borrones sueltos (bleed-through, marcas de
+    lapicera aisladas) que sobreviven al resto del pipeline.
+
+    Un speck de ruido cumple dos cosas a la vez: es chico respecto del cuerpo de
+    la firma Y está separado de ella. Los detalles legítimos de una firma (punto
+    de la i, tilde, parafa corta) son chicos pero están PEGADOS o muy cerca del
+    cuerpo. Por eso el filtro exige área pequeña relativa al componente mayor Y
+    un gap grande hasta él; así nunca borra partes reales de la firma.
+    """
+    if not np.any(binary):
+        return binary
+
+    H, W = binary.shape[:2]
+    long_side = max(H, W)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary, connectivity=8
+    )
+    if num_labels < 3:
+        return binary
+
+    areas    = stats[1:, cv2.CC_STAT_AREA]
+    largest  = int(np.argmax(areas)) + 1
+    a_max    = int(areas[largest - 1])
+    max_area = a_max * config.SPECK_MAX_AREA_RATIO
+    min_gap  = config.SPECK_MIN_GAP_RATIO * long_side
+
+    # Distancia de cada píxel al componente mayor (cuerpo de la firma)
+    inv = (labels != largest).astype(np.uint8)
+    dist_to_main = cv2.distanceTransform(inv, cv2.DIST_L2, 5)
+
+    to_remove = []
+    for i in range(1, num_labels):
+        if i == largest:
+            continue
+        if stats[i, cv2.CC_STAT_AREA] >= max_area:
+            continue
+        comp = labels == i
+        if float(dist_to_main[comp].min()) >= min_gap:
+            to_remove.append(i)
+
+    if to_remove:
+        binary = binary.copy()
+        binary[np.isin(labels, to_remove)] = 0
+        logger.debug(
+            f"Retoque: {len(to_remove)} manchita(s) aislada(s) eliminada(s)"
+        )
+    return binary
 
 
 def _isolate_main_cluster(binary: np.ndarray) -> np.ndarray:
@@ -539,14 +899,23 @@ def process_signature(input_path: str, output_path: str) -> None:
         from docx_converter import get_first_signature_from_docx
         bgr = get_first_signature_from_docx(input_path)
     else:
-        bgr = cv2.imread(input_path, cv2.IMREAD_COLOR)
-        if bgr is None:
+        # IMREAD_UNCHANGED preserva el canal alfa si existe; _flatten_to_bgr lo
+        # compone sobre blanco. Con IMREAD_COLOR los PNG transparentes se
+        # aplanaban sobre negro y rompían la binarización por completo.
+        raw = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
+        if raw is None:
             raise RuntimeError(
                 f"OpenCV no pudo leer la imagen: '{input_path}'. "
                 "Verifique que el archivo no esté corrupto."
             )
+        bgr = _flatten_to_bgr(raw)
 
     logger.debug(f"Imagen cargada: {bgr.shape[1]}x{bgr.shape[0]} px")
+
+    # ---- 1.4. Normalización de resolución de trabajo ------------------------
+    # Sube la resolución de imágenes pequeñas para que el grosor de trazo entre
+    # en el rango calibrado del pipeline (evita la sobre-erosión de trazos finos).
+    bgr = _normalize_resolution(bgr)
 
     # ---- 1.5. Remover footer de escáner (CamScanner, etc.) ------------------
     bgr = _remove_scanner_footer(bgr)
@@ -575,6 +944,22 @@ def process_signature(input_path: str, output_path: str) -> None:
     # ---- 8. Eliminación de artefactos y ruido ----------------------------
     binary_clean = _remove_artifacts(binary_clean)
 
+    # ---- 8.5. Fix D: descartar líneas rectas impresas (filetes/bordes) ----
+    binary_clean = _remove_straight_lines(binary_clean)
+
+    # ---- 8.6. Fix C: descartar manchas/sombras sólidas pegadas al borde ---
+    binary_clean = _remove_solid_blobs(binary_clean)
+
+    # ---- 8.7. Fix E: descartar bloque de texto impreso (nombre/cargo/RUT) --
+    # DESACTIVADO. La detección geométrica (baselines paralelas) no es confiable
+    # cuando el texto impreso usa una fuente cursiva/script y se SOLAPA con la
+    # firma: las palabras de texto fusionadas en un componente grande quedan
+    # protegidas (texto residual) mientras que bits chicos de la firma se
+    # confunden con texto y se borran (firma mutilada). Se deja la función
+    # _remove_printed_text_block disponible pero fuera del pipeline hasta tener
+    # un método robusto (p. ej. detector de texto por OCR/ML). Ver roadmap.
+    # binary_clean = _remove_printed_text_block(binary_clean)
+
     # ---- 9. Aislar cluster principal (descarta logos/sellos/marcas) -----
     # Conecta partes cercanas de la firma entre sí y descarta cualquier
     # tinta espacialmente aislada (logo de CamScanner, sello en esquina,
@@ -582,6 +967,9 @@ def process_signature(input_path: str, output_path: str) -> None:
     # de footer por línea horizontal, que falla cuando el escáner no
     # imprime divisoria visible.
     binary_clean = _isolate_main_cluster(binary_clean)
+
+    # ---- 9.5. Retoque: quitar manchitas aisladas (bleed-through, borrones) -
+    binary_clean = _remove_isolated_specks(binary_clean)
 
     # ---- 10. Detección del bounding-box de la firma -----------------------
     bbox = _find_signature_bbox(binary_clean)

@@ -25,6 +25,26 @@ from logger import setup_logger
 logger = setup_logger()
 
 
+def _imdecode_flatten(nparr: np.ndarray) -> np.ndarray | None:
+    """
+    Decodifica bytes de imagen preservando el canal alfa y lo compone sobre
+    BLANCO. Una firma embebida en Word como PNG transparente, decodificada con
+    IMREAD_COLOR, se aplanaría sobre negro e invertiría el mapa de tinta. Con
+    IMREAD_UNCHANGED + composición sobre blanco se procesa correctamente.
+    """
+    img = cv2.imdecode(nparr, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return None
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        bgr   = img[:, :, :3].astype(np.float32)
+        alpha = img[:, :, 3:4].astype(np.float32) / 255.0
+        white = np.full_like(bgr, 255.0)
+        return (bgr * alpha + white * (1.0 - alpha)).astype(np.uint8)
+    return img
+
+
 def _extract_from_docx_zip(docx_path: str) -> list[np.ndarray]:
     """
     Extrae imágenes de un archivo .docx tratándolo como ZIP.
@@ -39,7 +59,7 @@ def _extract_from_docx_zip(docx_path: str) -> list[np.ndarray]:
                 if filename.startswith('word/media/'):
                     image_bytes = zip_ref.read(filename)
                     nparr = np.frombuffer(image_bytes, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    img = _imdecode_flatten(nparr)
 
                     if img is not None:
                         images.append(img)
@@ -121,7 +141,7 @@ def extract_images_from_docx(docx_path: str) -> list[np.ndarray]:
                     image_bytes = image_part.blob
 
                     nparr = np.frombuffer(image_bytes, np.uint8)
-                    img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                    img = _imdecode_flatten(nparr)
 
                     if img is not None:
                         images.append(img)
@@ -155,7 +175,7 @@ def extract_images_from_docx(docx_path: str) -> list[np.ndarray]:
                     if "image" in rel.target_ref:
                         image_bytes = rel.target_part.blob
                         nparr = np.frombuffer(image_bytes, np.uint8)
-                        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                        img = _imdecode_flatten(nparr)
                         if img is not None:
                             images.append(img)
 

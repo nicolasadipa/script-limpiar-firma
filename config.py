@@ -29,6 +29,16 @@ PDF_DPI = 300          # Resolución al rasterizar la primera página del PDF
 # Pipeline de limpieza de imagen
 # ---------------------------------------------------------------------------
 
+# Normalización de resolución de trabajo
+# El resto de los parámetros del pipeline (kernel morfológico, áreas mínimas en
+# px²) están calibrados para escaneos de alta resolución (~2500px, tipo
+# CamScanner). En imágenes pequeñas (PNG exportados, firmas embebidas en docx,
+# screenshots) el trazo mide pocos píxeles y la apertura 3x3 + el filtro de
+# componentes los destruyen. Subir el lado largo hasta este valor devuelve el
+# grosor de trazo al rango donde esos parámetros son seguros. Solo se escala
+# HACIA ARRIBA: las imágenes grandes (el caso que ya funciona bien) no se tocan.
+WORK_LONG_SIDE_PX = 2000
+
 # Corrección de iluminación (CLAHE)
 CLAHE_CLIP_LIMIT    = 2.0    # Límite de amplificación de contraste local
 CLAHE_TILE_GRID     = (8, 8) # Tamaño de la cuadrícula de tiles
@@ -58,6 +68,42 @@ MORPH_CLOSE_ENABLE  = False      # Cierre deshabilitado por defecto
 MIN_COMPONENT_HEIGHT = 2         # Altura mínima permitida
 MIN_COMPONENT_WIDTH  = 2         # Ancho mínimo permitido
 MIN_COMPONENT_SIZE   = 95        # Área mínima (px²) para no considerar ruido residual
+
+# Fix D — Eliminación de líneas rectas impresas (filetes, bordes, subrayados de regla)
+# Una regla impresa es un componente larguísimo, finísimo y alineado a los ejes.
+# Se separa nítido de los trazos de firma (elongación ≤ ~5; un floreo recto de
+# firma llega a ~30). El umbral 60 + la exigencia de estar alineada a H/V evita
+# tocar trazos diagonales de la firma.
+LINE_ELONG_MIN       = 60.0   # Elongación PCA mínima (largo/grosor) para considerar "línea"
+LINE_MIN_LEN_RATIO   = 0.25   # Largo mínimo como fracción del lado largo de la imagen
+LINE_MAX_THICK_RATIO = 0.012  # Grosor medio máximo (fracción del lado largo): una regla es fina
+LINE_AXIS_TOL_DEG    = 12.0   # Tolerancia a horizontal/vertical en grados (las reglas son axis-aligned)
+
+# Fix C — Eliminación de manchas/sombras sólidas (sombra de escaneo, borrón de borde)
+# Un trazo de lapicera nunca tiene un grosor medio grande; una sombra rellena sí
+# (en el Caso 3 medía 68px de grosor medio vs 14px de la firma). Se exige además
+# que toque el borde de la imagen, que es donde caen las sombras de escaneo.
+BLOB_THICK_RATIO     = 0.015  # Grosor medio (fracción del lado largo) sobre el cual es "masa rellena", no trazo
+BLOB_MIN_AREA        = 2000   # Área mínima (px²) para que el filtro actúe (no toca detalles chicos)
+BLOB_REQUIRE_BORDER  = True   # Solo eliminar si el componente toca el borde de la imagen
+
+# Fix E — Eliminación de bloque de TEXTO IMPRESO (nombre/cargo/RUT bajo la firma)
+# No se usa varianza de grosor (en fuentes cursivas el texto tiene el mismo grosor
+# que la firma). Se detecta la ESTRUCTURA: varias baselines horizontales paralelas
+# formadas por muchos componentes chicos. Las guardas de área y elongación protegen
+# los trazos grandes de la firma, que nunca se eliminan aunque crucen el texto.
+TEXT_MAX_AREA_RATIO     = 0.20  # Un candidato a carácter mide < 20% del componente mayor
+TEXT_MAX_H_RATIO        = 0.12  # Altura máx de un carácter como fracción del lado largo
+TEXT_MAX_ELONG          = 6.0   # Elongación máx (excluye trazos largos/finos de la firma)
+TEXT_MIN_CHARS          = 6     # Mínimo de candidatos para evaluar bloque de texto
+TEXT_LINE_WIDTH_RATIO   = 0.30  # Extensión horizontal mínima de una línea (fracción del ancho)
+TEXT_BASELINE_FLAT_RATIO= 0.6   # Planitud: std de baseline <= este factor * altura de letra
+TEXT_MIN_CHARS_PER_LINE = 3     # Mínimo de componentes para que una línea sea "fuerte"
+TEXT_MIN_LINES          = 2     # Mínimo de líneas fuertes paralelas para confirmar el bloque
+
+# Retoque final — eliminación de manchitas aisladas (bleed-through, borrones sueltos)
+SPECK_MAX_AREA_RATIO  = 0.015 # Una manchita mide < 1.5% del cuerpo de la firma
+SPECK_MIN_GAP_RATIO   = 0.04  # Y está a > 4% del lado largo de distancia del cuerpo
 
 # Aislamiento del cluster principal (descarta logos/sellos espacialmente aislados)
 CLUSTER_DILATION_RATIO   = 0.08 # Fracción del lado largo usada como kernel de dilatación. 0.08 ≈ 200px en imagen 2500x. Une palabras separadas y huecos dentro de una palabra; no alcanza al footer típico (200-500px del cuerpo).
